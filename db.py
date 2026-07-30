@@ -1,50 +1,83 @@
-from pathlib import Path
+"""
+Build a SQLite DB of IPL 2021-2024 from the Kaggle IPL complete dataset.
+Expects matches.csv and deliveries.csv in the same folder.
+Produces: ipl_2021_2024.db  with two linked tables: matches, deliveries
+"""
+
 import sqlite3
+import pandas as pd
 
+MATCHES_CSV = "data/matches.csv"
+DELIVERIES_CSV = "data/deliveries.csv"
+DB_PATH = "ipl_2021_2024.db"
+YEARS = {2021, 2022, 2023, 2024}
 
-def build_database() -> None:
-    project_dir = Path(__file__).resolve().parent
+# ---------- 1. Load matches ----------
+matches = pd.read_csv(MATCHES_CSV)
 
-    sql_file = project_dir / "university_eval.sql"
-    database_file = project_dir / "university_eval.db"
+# The 'season' column in this dataset is messy: some rows are "2021",
+# others are like "2020/21" or "2009/10". Safest filter is the match DATE,
+# not the season string. Parse date and extract the year.
+matches["date"] = pd.to_datetime(matches["date"], errors="coerce", dayfirst=False)
 
-    if not sql_file.exists():
-        raise FileNotFoundError(
-            f"SQL file not found: {sql_file}"
-        )
+# a few rows may fail to parse depending on format; try dayfirst as fallback
+if matches["date"].isna().any():
+    fallback = pd.to_datetime(
+        matches.loc[matches["date"].isna(), "date"] if False else
+        pd.read_csv(MATCHES_CSV)["date"],
+        errors="coerce", dayfirst=True
+    )
+    matches["date"] = matches["date"].fillna(fallback)
 
-    sql_script = sql_file.read_text(encoding="utf-8")
+matches["year"] = matches["date"].dt.year
 
-    # Delete the old database so it is rebuilt from scratch.
-    if database_file.exists():
-        database_file.unlink()
+matches_filtered = matches[matches["year"].isin(YEARS)].copy()
 
-    connection = sqlite3.connect(database_file)
+# The match identifier column is named 'id' in this dataset.
+match_ids = set(matches_filtered["id"].unique())
+print(f"Matches in 2021-2024: {len(matches_filtered)}")
 
-    try:
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.executescript(sql_script)
-        connection.commit()
+# ---------- 2. Load deliveries, filter to those matches ----------
+# deliveries.csv is large (~260k rows); read then filter on match_id.
+deliveries = pd.read_csv(DELIVERIES_CSV)
 
-    except Exception:
-        connection.rollback()
+# The FK column linking deliveries -> matches is 'match_id'.
+deliveries_filtered = deliveries[deliveries["match_id"].isin(match_ids)].copy()
+print(f"Deliveries for those matches: {len(deliveries_filtered)}")
 
-        # Remove partially created database.
-        connection.close()
+# ---------- 3. Write to SQLite ----------
+conn = sqlite3.connect(DB_PATH)
 
-        if database_file.exists():
-            database_file.unlink()
+# drop the helper 'year' column before saving if you want a clean schema
+matches_to_save = matches_filtered.drop(columns=["year"])
 
-        raise
+matches_to_save.to_sql("matches", conn, if_exists="replace", index=False)
+deliveries_filtered.to_sql("deliveries", conn, if_exists="replace", index=False)
 
-    finally:
-        if connection:
-            connection.close()
+# ---------- 4. Add indexes so JOINs/queries are fast ----------
+cur = conn.cursor()
+cur.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_match ON deliveries(match_id)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_id ON matches(id)")
+conn.commit()
 
-    print("Database created successfully!")
-    print(f"SQL file: {sql_file}")
-    print(f"Database file: {database_file}")
+# ---------- 5. Sanity checks ----------
+print("\n--- Verification ---")
+print("matches rows:", cur.execute("SELECT COUNT(*) FROM matches").fetchone()[0])
+print("deliveries rows:", cur.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
 
+# confirm no orphan deliveries (every delivery links to a real match)
+orphans = cur.execute("""
+    SELECT COUNT(*) FROM deliveries d
+    LEFT JOIN matches m ON d.match_id = m.id
+    WHERE m.id IS NULL
+""").fetchone()[0]
+print("orphan deliveries (should be 0):", orphans)
 
-if __name__ == "__main__":
-    build_database()
+# show the season/year range actually captured
+yr = cur.execute("""
+    SELECT MIN(date), MAX(date) FROM matches
+""").fetchone()
+print("date range:", yr)
+
+conn.close()
+print(f"\nDone. Wrote {DB_PATH}")
