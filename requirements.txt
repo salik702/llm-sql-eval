@@ -1,0 +1,8 @@
+langchain-core
+langchain-mistralai
+langchain-groq
+langchain-openrouter
+langchain-openai
+langchain-google-genai
+python-dotenv
+pandas

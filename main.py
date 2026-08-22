@@ -1,22 +1,24 @@
 """
-main.py - controls the entire eval flow (ChatOpenRouter version).
+main.py - controls the entire eval flow.
 
 For each model:
-  1. load the model (via OpenRouter, through ChatOpenRouter)
+  1. load the model (provider-specific langchain class)
   2. run the golden dataset (generate SQL for each question)
   3. run the generated SQL on the DB (get a result)
   4. evaluate (compare to gold, using evaluator.py)
   5. log the score
 
+Supported providers: mistralai, groq, openrouter, openai_compat
+
 Files it depends on:
-  - schema.sql             (the schema, for the prompt)
-  - golden_dataset.csv     (questions + gold_sql + order_sensitive)
-  - model_openrouter_slug.py  (the 5 models under test -> MODELS)
-  - evaluator.py           (the comparison logic)
+  - schema.sql
+  - golden_dataset.csv
+  - models.py               (model definitions -> MODELS)
+  - evaluator.py            (comparison logic)
 
 Setup:
-  pip install langchain-openrouter python-dotenv pandas
-  .env file with:  OPENROUTER_API_KEY=sk-or-...
+  pip install langchain-mistralai langchain-groq langchain-openrouter langchain-openai python-dotenv pandas
+  .env file with:  OPENROUTER_API_KEY=sk-or-...  (and others as needed)
 """
 
 import os
@@ -25,22 +27,54 @@ import json
 import sqlite3
 import pandas as pd
 from dotenv import load_dotenv
-
-from langchain_openrouter import ChatOpenRouter
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from model_openrouter_slug import MODELS
+from models import MODELS
 from evaluator import evaluate_one
 
 # ---------- CONFIG ----------
 load_dotenv()
-API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 DB_PATH = "ipl_2021_2024.db"
 SCHEMA_PATH = "schema.sql"
 GOLDEN_PATH = "golden_dataset.csv"
 RESULTS_PATH = "eval_results.csv"
 # ----------------------------
+
+
+# ---------- LLM factory ----------
+def make_llm(model_cfg):
+    """Create a langchain chat model based on the provider specified in model_cfg."""
+    provider = model_cfg["provider"]
+    model = model_cfg["model"]
+
+    if provider == "mistralai":
+        from langchain_mistralai import ChatMistralAI
+        return ChatMistralAI(model=model, temperature=0, max_tokens=800)
+
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+        api_key = os.getenv("GROQ_API_KEY")
+        return ChatGroq(model=model, groq_api_key=api_key, temperature=0, max_tokens=800)
+
+    if provider == "openrouter":
+        from langchain_openrouter import ChatOpenRouter
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        return ChatOpenRouter(model=model, openrouter_api_key=api_key, temperature=0, max_tokens=800)
+
+    if provider == "openai_compat":
+        from langchain_openai import ChatOpenAI
+        api_key_env = model_cfg.get("api_key_env", "OPENAI_API_KEY")
+        api_key = os.getenv(api_key_env)
+        base_url = model_cfg.get("base_url")
+        return ChatOpenAI(model=model, api_key=api_key, base_url=base_url, temperature=0, max_tokens=800)
+
+    if provider == "google_genai":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        api_key = os.getenv("GOOGLE_API_KEY")
+        return ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=0, max_tokens=800)
+
+    raise ValueError(f"Unknown provider: {provider}")
 
 
 # ---------- helpers ----------
@@ -51,16 +85,6 @@ def load_schema():
 
 def load_golden():
     return pd.read_csv(GOLDEN_PATH)
-
-
-def make_llm(slug):
-    """Create a ChatOpenRouter model for one OpenRouter slug."""
-    return ChatOpenRouter(
-        model=slug,
-        openrouter_api_key=API_KEY,
-        temperature=0,
-        max_tokens=800,          # keep low: SQL is short, avoids credit-reservation error
-    )
 
 
 def clean_sql(raw):
@@ -79,7 +103,7 @@ def clean_sql(raw):
 
 
 def generate_sql(question, schema, llm):
-    """Ask one model for SQL via ChatOpenRouter. Returns cleaned SQL string."""
+    """Ask one model for SQL. Returns cleaned SQL string."""
     system_msg = (
         "You are a text-to-SQL generator. Given a database schema and a question, "
         "return a single SQL query that answers it. Use SQLite syntax. "
@@ -123,9 +147,17 @@ def run_eval():
     all_rows = []
     scoreboard = {}
 
-    for name, slug in MODELS:
-        print(f"\n{'='*60}\nMODEL: {name}  ({slug})\n{'='*60}")
-        llm = make_llm(slug)          # 1. load the model
+    for model_cfg in MODELS:
+        name = model_cfg["name"]
+        print(f"\n{'='*60}\nMODEL: {name}  ({model_cfg['provider']}/{model_cfg['model']})\n{'='*60}")
+
+        try:
+            llm = make_llm(model_cfg)
+        except Exception as e:
+            print(f"  FAILED to load model: {e}")
+            scoreboard[name] = 0
+            continue
+
         correct = 0
 
         for _, g in golden.iterrows():
@@ -134,7 +166,7 @@ def run_eval():
             order_sensitive = str(g["order_sensitive"]).upper() == "TRUE"
             gold_df = gold_result_to_df(g["gold_result_json"])
 
-            # 2. generate SQL
+            # generate SQL
             try:
                 sql = generate_sql(question, schema, llm)
             except Exception as e:
@@ -143,10 +175,10 @@ def run_eval():
                                      correct=False, reason="gen_error", sql=""))
                 continue
 
-            # 3. run on DB
+            # run on DB
             gen_df = run_sql(conn, sql)
 
-            # 4. evaluate
+            # evaluate
             verdict = evaluate_one(gold_df, gen_df, order_sensitive)
             if verdict["correct"]:
                 correct += 1
@@ -163,19 +195,16 @@ def run_eval():
 
     conn.close()
 
-    # 5. log final scores
+    # final scores
     print(f"\n{'='*60}\nFINAL SCOREBOARD (execution accuracy)\n{'='*60}")
     total = len(golden)
-    for name, _ in MODELS:
-        c = scoreboard[name]
-        print(f"  {name:18s} {c:2}/{total}  = {100*c/total:5.1f}%")
+    for model_cfg in MODELS:
+        c = scoreboard.get(model_cfg["name"], 0)
+        print(f"  {model_cfg['name']:25s} {c:2}/{total}  = {100*c/total:5.1f}%")
 
     pd.DataFrame(all_rows).to_csv(RESULTS_PATH, index=False)
     print(f"\nDetailed results saved -> {RESULTS_PATH}")
 
 
 if __name__ == "__main__":
-    if not API_KEY:
-        print("Missing OPENROUTER_API_KEY - add it to your .env file")
-    else:
-        run_eval()
+    run_eval()
